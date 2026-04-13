@@ -11,8 +11,16 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import sys
 import os
+import json
+import urllib.parse
+import urllib.request
 import joblib
 import matplotlib.pyplot as plt
+
+try:
+    from streamlit_geolocation import streamlit_geolocation
+except Exception:
+    streamlit_geolocation = None
 
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -80,6 +88,171 @@ def load_demo_data():
     return df
 
 
+def _aqi_category_us(aqi_value):
+    """Return US AQI category and short health guidance."""
+    if aqi_value <= 50:
+        return "Good", "Air quality is satisfactory for most people."
+    if aqi_value <= 100:
+        return "Moderate", "Acceptable air quality; unusually sensitive people should reduce prolonged outdoor exertion."
+    if aqi_value <= 150:
+        return "Unhealthy for Sensitive Groups", "Sensitive groups may experience health effects."
+    if aqi_value <= 200:
+        return "Unhealthy", "Everyone may begin to feel health effects; limit prolonged outdoor activity."
+    if aqi_value <= 300:
+        return "Very Unhealthy", "Health alert: everyone should reduce outdoor activity."
+    return "Hazardous", "Emergency conditions: avoid outdoor activity."
+
+
+def _geocode_location(location_name):
+    """Resolve a city/place text into coordinates using Open-Meteo Geocoding API."""
+    if not location_name.strip():
+        raise ValueError("Please provide a location name.")
+
+    query = urllib.parse.urlencode({
+        'name': location_name.strip(),
+        'count': 1,
+        'language': 'en',
+        'format': 'json'
+    })
+    url = f"https://geocoding-api.open-meteo.com/v1/search?{query}"
+
+    with urllib.request.urlopen(url, timeout=20) as response:
+        payload = json.loads(response.read().decode('utf-8'))
+
+    results = payload.get('results') or []
+    if not results:
+        raise ValueError(f"No location found for '{location_name}'.")
+
+    match = results[0]
+    label_parts = [
+        match.get('name', ''),
+        match.get('admin1', ''),
+        match.get('country', '')
+    ]
+    label = ", ".join([p for p in label_parts if p])
+
+    return {
+        'latitude': match['latitude'],
+        'longitude': match['longitude'],
+        'label': label or location_name.strip()
+    }
+
+
+def _fetch_weekly_aqi_forecast(latitude, longitude):
+    """Fetch up to 7 days of hourly AQI data and aggregate it to daily forecast."""
+    params = urllib.parse.urlencode({
+        'latitude': latitude,
+        'longitude': longitude,
+        'hourly': 'us_aqi,european_aqi,pm2_5,pm10,nitrogen_dioxide,sulphur_dioxide,ozone,carbon_monoxide',
+        'forecast_days': 7,
+        'timezone': 'auto'
+    })
+    url = f"https://air-quality-api.open-meteo.com/v1/air-quality?{params}"
+
+    with urllib.request.urlopen(url, timeout=20) as response:
+        payload = json.loads(response.read().decode('utf-8'))
+
+    hourly = payload.get('hourly')
+    if not hourly or 'time' not in hourly:
+        raise RuntimeError("AQI forecast data is unavailable for this location right now.")
+
+    frame = pd.DataFrame(hourly)
+    frame['time'] = pd.to_datetime(frame['time'])
+    frame['date'] = frame['time'].dt.date
+
+    numeric_cols = [
+        'us_aqi', 'european_aqi', 'pm2_5', 'pm10', 'nitrogen_dioxide',
+        'sulphur_dioxide', 'ozone', 'carbon_monoxide'
+    ]
+    for col in numeric_cols:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors='coerce')
+
+    # Keep AQI in the valid US AQI range and fallback when provider values are inconsistent.
+    if 'us_aqi' in frame.columns:
+        frame['us_aqi_clean'] = frame['us_aqi']
+    else:
+        frame['us_aqi_clean'] = np.nan
+
+    frame.loc[(frame['us_aqi_clean'] < 0) | (frame['us_aqi_clean'] > 500), 'us_aqi_clean'] = np.nan
+
+    if 'european_aqi' in frame.columns:
+        eu_aqi = frame['european_aqi'].where(
+            (frame['european_aqi'] >= 0) & (frame['european_aqi'] <= 150)
+        )
+        eu_scaled_to_us = (eu_aqi * 5).clip(0, 500)
+        frame['us_aqi_clean'] = frame['us_aqi_clean'].fillna(eu_scaled_to_us)
+
+    frame['us_aqi_clean'] = frame['us_aqi_clean'].clip(0, 500)
+
+    if frame['us_aqi_clean'].notna().sum() == 0:
+        raise RuntimeError("AQI forecast returned invalid values. Please try another location.")
+
+    daily = frame.groupby('date', as_index=False).agg({
+        'us_aqi_clean': 'max',
+        'pm2_5': 'mean',
+        'pm10': 'mean',
+        'nitrogen_dioxide': 'mean',
+        'sulphur_dioxide': 'mean',
+        'ozone': 'mean',
+        'carbon_monoxide': 'mean'
+    })
+    daily.rename(columns={'us_aqi_clean': 'us_aqi'}, inplace=True)
+
+    daily['date'] = pd.to_datetime(daily['date'])
+    daily = daily.sort_values('date').reset_index(drop=True)
+    return daily
+
+
+def _render_weekly_forecast_results(latitude, longitude, location_label):
+    """Render forecast KPIs, chart, and table for a location."""
+    daily_forecast = _fetch_weekly_aqi_forecast(latitude, longitude)
+
+    st.success(f"Forecast loaded for {location_label} ({latitude:.3f}, {longitude:.3f})")
+
+    weekly_avg = daily_forecast['us_aqi'].mean()
+    worst_idx = daily_forecast['us_aqi'].idxmax()
+    worst_day = daily_forecast.loc[worst_idx]
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Weekly Avg AQI", f"{weekly_avg:.1f}")
+    col2.metric("Worst Daily AQI", f"{worst_day['us_aqi']:.1f}")
+    col3.metric("Worst Day", worst_day['date'].strftime('%a, %d %b'))
+
+    chart_df = daily_forecast.copy()
+    chart_df['Date'] = chart_df['date'].dt.strftime('%Y-%m-%d')
+
+    fig = px.line(
+        chart_df,
+        x='Date',
+        y='us_aqi',
+        markers=True,
+        title='Predicted Daily AQI (US AQI)'
+    )
+    fig.update_layout(yaxis_title='US AQI (0-500)', xaxis_title='Date', height=420)
+    st.plotly_chart(fig, use_container_width=True)
+
+    display_df = chart_df[['Date', 'us_aqi', 'pm2_5', 'pm10', 'nitrogen_dioxide', 'ozone']].copy()
+    display_df.rename(columns={
+        'us_aqi': 'Predicted_AQI',
+        'pm2_5': 'PM2.5',
+        'pm10': 'PM10',
+        'nitrogen_dioxide': 'NO2',
+        'ozone': 'O3'
+    }, inplace=True)
+
+    display_df['AQI_Category'] = display_df['Predicted_AQI'].apply(
+        lambda x: _aqi_category_us(float(x))[0] if pd.notna(x) else "Unknown"
+    )
+
+    st.subheader("7-Day Forecast Table")
+    st.dataframe(display_df, use_container_width=True)
+
+    worst_category, guidance = _aqi_category_us(float(worst_day['us_aqi']))
+    st.warning(f"Highest risk period: {worst_category}. {guidance}")
+    st.caption("Data source: Open-Meteo Air Quality API (CAMS). AQI is sanity-checked to the valid US AQI range (0-500).")
+
+
 def main():
     """Main application"""
     
@@ -91,7 +264,7 @@ def main():
     st.sidebar.title("Navigation")
     page = st.sidebar.radio(
         "Go to",
-        ["🏠 Home", "📊 Data Explorer", "🤖 Model Training", "🔮 AQI Predictor"]
+        ["🏠 Home", "📊 Data Explorer", "🤖 Model Training", "📍 7-Day AQI Forecast", "🔮 AQI Predictor"]
     )
     
     # =======================
@@ -390,6 +563,69 @@ def main():
                     
                 except Exception as e:
                     st.error(f"Error during training: {str(e)}")
+
+    # =======================
+    # 7-DAY AQI FORECAST
+    # =======================
+    elif page == "📍 7-Day AQI Forecast":
+        st.title("Location-Based AQI Forecast (Next 7 Days)")
+        st.info("Forecast powered by Open-Meteo Air Quality API using your selected location.")
+
+        if streamlit_geolocation is not None:
+            st.caption("Allow browser location access to auto-fill your current coordinates.")
+            geo = streamlit_geolocation()
+            if geo and geo.get('latitude') is not None and geo.get('longitude') is not None:
+                if st.button("📡 Use Current Location", key="use_current_location"):
+                    try:
+                        _render_weekly_forecast_results(
+                            float(geo['latitude']),
+                            float(geo['longitude']),
+                            "your current location"
+                        )
+                    except Exception as e:
+                        st.error(f"Could not fetch forecast: {str(e)}")
+        else:
+            st.caption("Install optional package for one-click current location: pip install streamlit-geolocation")
+
+        input_mode = st.radio(
+            "Choose input mode",
+            ["Search by city/place", "Enter coordinates"],
+            horizontal=True
+        )
+
+        latitude = None
+        longitude = None
+
+        if input_mode == "Search by city/place":
+            location_query = st.text_input("City or place", value="Bhubaneswar")
+            if st.button("📍 Get 7-Day Forecast", type="primary"):
+                try:
+                    location = _geocode_location(location_query)
+                    _render_weekly_forecast_results(
+                        location['latitude'],
+                        location['longitude'],
+                        location['label']
+                    )
+
+                except Exception as e:
+                    st.error(f"Could not fetch forecast: {str(e)}")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                latitude = st.number_input("Latitude", min_value=-90.0, max_value=90.0, value=20.296, format="%.6f")
+            with col2:
+                longitude = st.number_input("Longitude", min_value=-180.0, max_value=180.0, value=85.824, format="%.6f")
+
+            if st.button("📍 Get 7-Day Forecast", type="primary"):
+                try:
+                    _render_weekly_forecast_results(
+                        latitude,
+                        longitude,
+                        "your entered coordinates"
+                    )
+
+                except Exception as e:
+                    st.error(f"Could not fetch forecast: {str(e)}")
 
     # =======================
     # AQI PREDICTOR
